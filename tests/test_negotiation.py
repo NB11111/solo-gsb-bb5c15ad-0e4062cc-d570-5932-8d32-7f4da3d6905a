@@ -6,10 +6,12 @@ from app.negotiation import (
     AcceptLanguageError,
     LocaleFallbackError,
     ParticipantHeaderError,
+    SampleHeaderError,
     negotiate,
     negotiate_group,
     normalize_fallbacks,
     parse_accept_language,
+    plan_coverage,
     truncation_chain,
     validate_fallback_chains,
 )
@@ -560,3 +562,88 @@ class TestGroupNegotiate:
             self.DEFAULT,
         )
         assert result["candidates"][0]["total_q"] == 0.3
+
+
+class TestCoveragePlan:
+    def test_basic_improvement(self):
+        result = plan_coverage(
+            samples=[("fr;q=0.9", 100.0), ("de", 50.0), ("en", 200.0)],
+            supported=["en-US"],
+            default="en-US",
+            candidates=["fr-FR", "de-DE"],
+            max_additions=2,
+        )
+        assert result["selected_additions"] == ["fr-FR", "de-DE"]
+        assert result["baseline_fallback_traffic"] == 150.0
+        assert result["improved_traffic"] == 150.0
+        reports = result["samples"]
+        assert [r["position"] for r in reports] == [1, 2, 3]
+        assert [r["improved"] for r in reports] == [True, True, False]
+        assert reports[0]["baseline_selected_language"] == "en-US"
+        assert reports[0]["baseline_fallback"] is True
+        assert reports[0]["planned_selected_language"] == "fr-FR"
+        assert reports[0]["planned_fallback"] is False
+        # Already a normal hit in the baseline: unchanged, not improved.
+        assert reports[2]["baseline_fallback"] is False
+        assert reports[2]["planned_selected_language"] == "en-US"
+
+    def test_tie_prefers_fewer_additions(self):
+        result = plan_coverage(
+            samples=[("fr", 100.0)],
+            supported=["en-US"],
+            default="en-US",
+            candidates=["fr-FR", "es-ES"],
+            max_additions=2,
+        )
+        assert result["selected_additions"] == ["fr-FR"]
+        assert result["improved_traffic"] == 100.0
+
+    def test_tie_prefers_earlier_candidate_input_order(self):
+        result = plan_coverage(
+            samples=[("de,fr", 80.0)],
+            supported=["en-US"],
+            default="en-US",
+            candidates=["de-DE", "fr-FR"],
+            max_additions=1,
+        )
+        assert result["selected_additions"] == ["de-DE"]
+
+    def test_no_improvement_recommends_nothing(self):
+        # fr is q=0-excluded even once added; a headerless sample always
+        # falls back to the default regardless of the supported list.
+        result = plan_coverage(
+            samples=[("fr;q=0", 60.0), (None, 30.0)],
+            supported=["en-US"],
+            default="en-US",
+            candidates=["fr-FR", "de-DE"],
+            max_additions=2,
+        )
+        assert result["selected_additions"] == []
+        assert result["improved_traffic"] == 0.0
+        assert result["baseline_fallback_traffic"] == 90.0
+        assert [r["improved"] for r in result["samples"]] == [False, False]
+        assert all(r["planned_fallback"] for r in result["samples"])
+
+    def test_traffic_sums_have_no_float_noise(self):
+        result = plan_coverage(
+            samples=[("fr", 0.1), ("de", 0.2)],
+            supported=["en-US"],
+            default="en-US",
+            candidates=["fr-FR", "de-DE"],
+            max_additions=2,
+        )
+        assert result["baseline_fallback_traffic"] == 0.3
+        assert result["improved_traffic"] == 0.3
+
+    def test_invalid_sample_header_raises_with_position(self):
+        with pytest.raises(SampleHeaderError) as excinfo:
+            plan_coverage(
+                samples=[("en", 1.0), ("fr;q=2", 1.0)],
+                supported=["en-US"],
+                default="en-US",
+                candidates=["fr-FR"],
+                max_additions=1,
+            )
+        exc = excinfo.value
+        assert isinstance(exc, AcceptLanguageError)
+        assert exc.position == 2

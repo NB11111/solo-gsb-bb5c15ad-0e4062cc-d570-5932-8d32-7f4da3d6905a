@@ -21,16 +21,20 @@ from .negotiation import (
 )
 
 
-def _check_supported_tags(value: list[str]) -> list[str]:
+def _check_unique_tags(value: list[str], field: str) -> list[str]:
     normalized_seen: set[str] = set()
     for tag in value:
         if not isinstance(tag, str) or not TAG_RE.fullmatch(tag):
             raise ValueError(f"不是合法的 BCP 47 标签: {tag!r}")
         key = tag.lower()
         if key in normalized_seen:
-            raise ValueError(f"supported_languages 存在重复标签（大小写不敏感）: {tag!r}")
+            raise ValueError(f"{field} 存在重复标签（大小写不敏感）: {tag!r}")
         normalized_seen.add(key)
     return value
+
+
+def _check_supported_tags(value: list[str]) -> list[str]:
+    return _check_unique_tags(value, "supported_languages")
 
 
 def _check_default_tag(value: str) -> str:
@@ -295,6 +299,118 @@ class GroupNegotiationResponse(BaseModel):
     message: str
     participants: list[GroupParticipantReport]
     candidates: list[GroupCandidateReport]
+
+
+class CoverageSample(BaseModel):
+    """One traffic-weighted Accept-Language sample for coverage planning."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accept_language: str | None = Field(
+        default=None,
+        title="该样本的原始 Accept-Language 头",
+        description="缺失/null/空白视为无有效范围（恒定走默认兜底，无法被改善）",
+    )
+    traffic: float = Field(
+        ge=0,
+        allow_inf_nan=False,
+        title="该样本代表的流量",
+        description="非负数值；规划按流量求和评估各候选子集",
+    )
+
+
+class CoveragePlanRequest(BaseModel):
+    """Coverage planning input.
+
+    ``samples`` are traffic-weighted Accept-Language headers evaluated
+    with the exact semantics of the single negotiation endpoint;
+    ``candidates`` are 1-12 new languages under consideration and
+    ``max_additions`` caps how many of them a plan may add (1-3).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_languages: list[str] = Field(
+        min_length=1,
+        title="当前服务端支持的 BCP 47 语言标签（按优先级/稳定顺序排列）",
+    )
+    default_language: str = Field(
+        title="默认语言标签，必须包含在 supported_languages 中"
+    )
+    samples: list[CoverageSample] = Field(
+        min_length=1,
+        title="带非负 traffic 的 Accept-Language 样本（至少 1 个）",
+    )
+    candidates: list[str] = Field(
+        min_length=1,
+        max_length=12,
+        title="候选新增语言（1～12 个，不可重复，且不得已在支持列表中）",
+    )
+    max_additions: int = Field(
+        ge=1,
+        le=3,
+        title="最多新增语言数（1～3）",
+    )
+
+    @field_validator("supported_languages")
+    @classmethod
+    def _validate_supported(cls, value: list[str]) -> list[str]:
+        return _check_supported_tags(value)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default(cls, value: str) -> str:
+        return _check_default_tag(value)
+
+    @field_validator("candidates")
+    @classmethod
+    def _validate_candidates(cls, value: list[str]) -> list[str]:
+        return _check_unique_tags(value, "candidates")
+
+    @model_validator(mode="after")
+    def _default_must_be_supported(self) -> "CoveragePlanRequest":
+        _check_default_in_supported(self.supported_languages, self.default_language)
+        return self
+
+    @model_validator(mode="after")
+    def _candidates_must_extend_supported(self) -> "CoveragePlanRequest":
+        supported_lower = {tag.lower() for tag in self.supported_languages}
+        for tag in self.candidates:
+            if tag.lower() in supported_lower:
+                raise ValueError(
+                    f"candidates 与 supported_languages 重复（大小写不敏感）: {tag!r}"
+                )
+        return self
+
+
+class CoverageSamplePlan(BaseModel):
+    position: int = Field(description="在 samples 数组中的序号（从 1 开始）")
+    traffic: float = Field(description="该样本的流量（原样回显）")
+    baseline_selected_language: str = Field(
+        description="规划前（现有支持列表）选中的语言"
+    )
+    baseline_fallback: bool = Field(description="规划前是否回退到默认语言")
+    planned_selected_language: str = Field(
+        description="按选中方案新增语言后选中的语言"
+    )
+    planned_fallback: bool = Field(
+        description="按选中方案新增语言后是否仍回退到默认语言"
+    )
+    improved: bool = Field(description="是否由默认兜底转为正常命中")
+
+
+class CoveragePlanResponse(BaseModel):
+    selected_additions: list[str] = Field(
+        description="建议新增的语言（按候选输入顺序；空列表表示无需新增）"
+    )
+    baseline_fallback_traffic: float = Field(
+        description="现有支持列表下回退到默认语言的总流量"
+    )
+    improved_traffic: float = Field(
+        description="按选中方案新增语言后可从默认兜底转为正常命中的流量"
+    )
+    message: str
+    samples: list[CoverageSamplePlan]
 
 
 class HealthResponse(BaseModel):

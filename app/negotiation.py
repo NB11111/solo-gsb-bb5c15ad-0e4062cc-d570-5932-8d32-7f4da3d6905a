@@ -22,7 +22,15 @@ Implements the negotiation rules required by the service:
   form a participants x candidates matrix, any candidate excluded by a
   participant's concrete ``q=0`` range is globally vetoed, and the winner
   is chosen by highest minimum personal weight, then highest total
-  weight, then server-list order.
+  weight, then server-list order;
+* :func:`plan_coverage` reuses the exact same per-request negotiation
+  semantics for capacity planning: every traffic-weighted
+  Accept-Language sample is negotiated against the current supported
+  list (baseline) and against that list extended by each candidate
+  subset of up to ``max_additions`` new languages; the subset moving
+  the most traffic from the default fallback to a normal hit wins,
+  ties broken by fewer additions, then by earlier candidate input
+  order.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -33,6 +41,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any
 
 # RFC 5646 section 2.1 grammar (main tag grammar, no grandfathered tags).
@@ -71,6 +80,21 @@ class ParticipantHeaderError(AcceptLanguageError):
         super().__init__(
             f"第 {position} 位参与者 {participant_id!r} 的 "
             f"Accept-Language 非法: {detail}"
+        )
+
+
+class SampleHeaderError(AcceptLanguageError):
+    """A coverage-plan sample's Accept-Language header failed to parse.
+
+    Carries the 1-based ``position`` of the offending sample so the API
+    layer can point the 422 response at the exact ``samples`` array
+    element.
+    """
+
+    def __init__(self, position: int, detail: str):
+        self.position = position
+        super().__init__(
+            f"第 {position} 个样本的 Accept-Language 非法: {detail}"
         )
 
 
@@ -697,4 +721,117 @@ def negotiate_group(
         "message": message,
         "participants": participant_reports,
         "candidates": candidates,
+    }
+
+
+def plan_coverage(
+    samples: list[tuple[str | None, float]],
+    supported: list[str],
+    default: str,
+    candidates: list[str],
+    max_additions: int,
+) -> dict[str, Any]:
+    """Plan which candidate languages to add for better traffic coverage.
+
+    ``samples`` is a non-empty list of ``(accept_language, traffic)``
+    pairs with non-negative traffic. Every sample is evaluated with the
+    exact semantics of :func:`negotiate` (no ``locale_fallbacks``): first
+    against the current ``supported`` list (the baseline), then against
+    ``supported`` extended by each candidate subset of up to
+    ``max_additions`` new languages (appended in candidate input order,
+    so existing entries keep their tie-break priority).
+
+    A sample counts as *improved* when it falls back to the default
+    language in the baseline but is a normal hit after the additions;
+    ``improved_traffic`` is the sum of improved samples' traffic. The
+    exhaustive search ranks subsets by improved traffic, breaking ties
+    by fewer additions and then by earlier candidate input order. The
+    empty subset participates, so when no combination improves anything
+    the plan recommends adding nothing.
+    """
+
+    baseline: list[tuple[str, bool]] = []
+    for position, (header, _traffic) in enumerate(samples, start=1):
+        try:
+            outcome = negotiate(
+                header=header, supported=supported, default=default
+            )
+        except AcceptLanguageError as exc:
+            raise SampleHeaderError(position, str(exc)) from exc
+        baseline.append((outcome["selected_language"], outcome["fallback"]))
+
+    traffics = [float(traffic) for _header, traffic in samples]
+    # Traffic sums absorb binary float noise via round(..., 6), mirroring
+    # the group endpoint's total_q handling, so equal totals tie reliably.
+    baseline_fallback_traffic = round(
+        sum(
+            traffic
+            for traffic, (_selected, fell_back) in zip(traffics, baseline)
+            if fell_back
+        ),
+        6,
+    )
+    fallback_indices = [
+        index for index, (_selected, fell_back) in enumerate(baseline) if fell_back
+    ]
+
+    best_combo: tuple[int, ...] = ()
+    best_improved = 0.0
+    # Sizes ascend (fewer additions win ties) and combinations() yields
+    # index tuples in candidate input order (earlier input wins ties), so
+    # replacing only on a strictly greater improvement implements the
+    # full tie-break contract.
+    for size in range(1, max_additions + 1):
+        for combo in combinations(range(len(candidates)), size):
+            extended = supported + [candidates[i] for i in combo]
+            improved = 0.0
+            # Only baseline-fallback samples can convert to a normal hit.
+            for index in fallback_indices:
+                outcome = negotiate(
+                    header=samples[index][0], supported=extended, default=default
+                )
+                if not outcome["fallback"]:
+                    improved += traffics[index]
+            improved = round(improved, 6)
+            if improved > best_improved:
+                best_improved = improved
+                best_combo = combo
+
+    additions = [candidates[i] for i in best_combo]
+    extended = supported + additions
+    sample_reports: list[dict[str, Any]] = []
+    for position, ((header, traffic), (base_selected, base_fell_back)) in enumerate(
+        zip(samples, baseline), start=1
+    ):
+        planned = negotiate(header=header, supported=extended, default=default)
+        sample_reports.append(
+            {
+                "position": position,
+                "traffic": traffic,
+                "baseline_selected_language": base_selected,
+                "baseline_fallback": base_fell_back,
+                "planned_selected_language": planned["selected_language"],
+                "planned_fallback": planned["fallback"],
+                "improved": base_fell_back and not planned["fallback"],
+            }
+        )
+
+    if additions:
+        message = (
+            f"穷举所有不超过 {max_additions} 个新增的候选组合后，新增 "
+            f"{'、'.join(additions)} 可将 {best_improved:g} 的默认兜底流量"
+            "转为正常命中（同分按新增数更少、候选输入序更早取舍）"
+        )
+    else:
+        message = (
+            f"所有不超过 {max_additions} 个新增的候选组合都无法将默认兜底流量"
+            "转为正常命中，建议不新增语言"
+        )
+
+    return {
+        "selected_additions": additions,
+        "baseline_fallback_traffic": baseline_fallback_traffic,
+        "improved_traffic": best_improved,
+        "message": message,
+        "samples": sample_reports,
     }

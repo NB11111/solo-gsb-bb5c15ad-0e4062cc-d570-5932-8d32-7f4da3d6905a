@@ -9,10 +9,14 @@ from . import __version__
 from .negotiation import (
     AcceptLanguageError,
     ParticipantHeaderError,
+    SampleHeaderError,
     negotiate,
     negotiate_group,
+    plan_coverage,
 )
 from .schemas import (
+    CoveragePlanRequest,
+    CoveragePlanResponse,
     GroupNegotiationRequest,
     GroupNegotiationResponse,
     HealthResponse,
@@ -55,6 +59,31 @@ async def accept_language_error_handler(
 
 # Pydantic request validation uses FastAPI's built-in 422 handler,
 # which returns the standard {"detail": [...]} envelope.
+
+
+@app.exception_handler(SampleHeaderError)
+async def sample_header_error_handler(
+    request: Request, exc: SampleHeaderError
+) -> JSONResponse:
+    # Same 422 envelope shape, but located at the offending sample's
+    # array element (FastAPI loc paths use 0-based array indices).
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "loc": [
+                        "body",
+                        "samples",
+                        exc.position - 1,
+                        "accept_language",
+                    ],
+                    "msg": str(exc),
+                    "type": "accept_language.syntax_error",
+                }
+            ]
+        },
+    )
 
 
 @app.exception_handler(ParticipantHeaderError)
@@ -128,6 +157,25 @@ async def negotiate_group_language(
         default=payload.default_language,
     )
     return GroupNegotiationResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/negotiate/coverage-plan",
+    response_model=CoveragePlanResponse,
+    tags=["语言协商"],
+    summary="候选语言覆盖规划",
+)
+async def negotiate_coverage_plan(
+    payload: CoveragePlanRequest,
+) -> CoveragePlanResponse:
+    result = plan_coverage(
+        samples=[(s.accept_language, s.traffic) for s in payload.samples],
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        candidates=payload.candidates,
+        max_additions=payload.max_additions,
+    )
+    return CoveragePlanResponse.model_validate(result)
 
 
 @app.get("/", tags=["元信息"])

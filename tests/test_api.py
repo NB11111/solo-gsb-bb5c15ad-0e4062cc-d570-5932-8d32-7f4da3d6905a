@@ -434,3 +434,259 @@ def test_group_extra_field_rejected_422():
         }
     )
     assert response.status_code == 422
+
+
+def _post_coverage(payload):
+    return client.post("/api/v1/negotiate/coverage-plan", json=payload)
+
+
+def test_coverage_plan_basic():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [
+                {"accept_language": "fr;q=0.9", "traffic": 100},
+                {"accept_language": "de", "traffic": 50},
+                {"accept_language": "en", "traffic": 200},
+            ],
+            "candidates": ["fr-FR", "de-DE"],
+            "max_additions": 2,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_additions"] == ["fr-FR", "de-DE"]
+    assert body["baseline_fallback_traffic"] == 150.0
+    assert body["improved_traffic"] == 150.0
+    samples = body["samples"]
+    assert [s["position"] for s in samples] == [1, 2, 3]
+    assert [s["traffic"] for s in samples] == [100.0, 50.0, 200.0]
+    assert samples[0]["baseline_selected_language"] == "en-US"
+    assert samples[0]["baseline_fallback"] is True
+    assert samples[0]["planned_selected_language"] == "fr-FR"
+    assert samples[0]["planned_fallback"] is False
+    assert samples[0]["improved"] is True
+    assert samples[1]["planned_selected_language"] == "de-DE"
+    assert samples[1]["improved"] is True
+    # en already hits en-US in the baseline: unchanged, not improved.
+    assert samples[2]["baseline_fallback"] is False
+    assert samples[2]["planned_selected_language"] == "en-US"
+    assert samples[2]["improved"] is False
+
+
+def test_coverage_plan_tie_prefers_fewer_additions():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": 100}],
+            "candidates": ["fr-FR", "es-ES"],
+            "max_additions": 2,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["selected_additions"] == ["fr-FR"]
+    assert body["improved_traffic"] == 100.0
+
+
+def test_coverage_plan_tie_prefers_earlier_candidate_input_order():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "de,fr", "traffic": 80}],
+            "candidates": ["de-DE", "fr-FR"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 200
+    assert response.json()["selected_additions"] == ["de-DE"]
+
+
+def test_coverage_plan_no_improvement_selects_empty():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [
+                {"accept_language": "fr;q=0", "traffic": 60},
+                {"traffic": 30},
+            ],
+            "candidates": ["fr-FR", "de-DE"],
+            "max_additions": 2,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # fr stays q=0-excluded even after being added; the headerless sample
+    # always falls back. Nothing improves -> recommend adding nothing.
+    assert body["selected_additions"] == []
+    assert body["improved_traffic"] == 0.0
+    assert body["baseline_fallback_traffic"] == 90.0
+    assert [s["improved"] for s in body["samples"]] == [False, False]
+    assert all(s["planned_fallback"] for s in body["samples"])
+
+
+def test_coverage_plan_q_zero_exclusion_blocks_conversion():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [
+                {"accept_language": "en;q=0,fr;q=0.9", "traffic": 120},
+            ],
+            "candidates": ["fr-FR"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # en-US is q=0-excluded in the baseline; adding fr-FR converts the
+    # sample to a normal hit.
+    assert body["baseline_fallback_traffic"] == 120.0
+    assert body["selected_additions"] == ["fr-FR"]
+    assert body["improved_traffic"] == 120.0
+    sample = body["samples"][0]
+    assert sample["baseline_fallback"] is True
+    assert sample["planned_selected_language"] == "fr-FR"
+    assert sample["improved"] is True
+
+
+def test_coverage_plan_negative_traffic_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": -1}],
+            "candidates": ["fr-FR"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_coverage_plan_empty_samples_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [],
+            "candidates": ["fr-FR"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_coverage_plan_candidates_bounds_422():
+    base = {
+        "supported_languages": ["en-US"],
+        "default_language": "en-US",
+        "samples": [{"accept_language": "fr", "traffic": 1}],
+        "max_additions": 1,
+    }
+    assert _post_coverage({**base, "candidates": []}).status_code == 422
+    thirteen = [f"q{i}z" for i in range(13)]
+    assert (
+        _post_coverage({**base, "candidates": thirteen}).status_code == 422
+    )
+
+
+def test_coverage_plan_max_additions_bounds_422():
+    base = {
+        "supported_languages": ["en-US"],
+        "default_language": "en-US",
+        "samples": [{"accept_language": "fr", "traffic": 1}],
+        "candidates": ["fr-FR"],
+    }
+    assert _post_coverage({**base, "max_additions": 0}).status_code == 422
+    assert _post_coverage({**base, "max_additions": 4}).status_code == 422
+
+
+def test_coverage_plan_duplicate_candidates_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": 1}],
+            "candidates": ["fr-FR", "FR-fr"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+    assert "重复" in response.json()["detail"][0]["msg"]
+
+
+def test_coverage_plan_candidate_already_supported_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US", "fr-FR"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": 1}],
+            "candidates": ["FR-fr"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+    assert "重复" in response.json()["detail"][0]["msg"]
+
+
+def test_coverage_plan_invalid_candidate_tag_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": 1}],
+            "candidates": ["not a tag"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_coverage_plan_invalid_sample_header_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [
+                {"accept_language": "en", "traffic": 1},
+                {"accept_language": "fr;q=2", "traffic": 1},
+            ],
+            "candidates": ["fr-FR"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert detail[0]["loc"] == ["body", "samples", 1, "accept_language"]
+    assert detail[0]["type"] == "accept_language.syntax_error"
+
+
+def test_coverage_plan_default_not_in_supported_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "fr-FR",
+            "samples": [{"accept_language": "fr", "traffic": 1}],
+            "candidates": ["de-DE"],
+            "max_additions": 1,
+        }
+    )
+    assert response.status_code == 422
+
+
+def test_coverage_plan_extra_field_rejected_422():
+    response = _post_coverage(
+        {
+            "supported_languages": ["en-US"],
+            "default_language": "en-US",
+            "samples": [{"accept_language": "fr", "traffic": 1}],
+            "candidates": ["fr-FR"],
+            "max_additions": 1,
+            "unexpected": 1,
+        }
+    )
+    assert response.status_code == 422

@@ -7,7 +7,11 @@ BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4
 源标签 → 下一标签有向链做定向回退。此外，`/api/v1/negotiate/group` 提供**群体
 协商**：多位参与者各自给出 `Accept-Language`，逐人复用同一套匹配语义构成权重
 矩阵，具体范围 `q=0` 全局否决，按最低个人权重 → 总权重 → 服务端顺序选出共同
-接受的语言。
+接受的语言。`/api/v1/negotiate/coverage-plan` 提供**覆盖规划**：给定带非负
+traffic 的 `Accept-Language` 流量样本与 1～12 个候选新增语言，穷举所有不超过
+`max_additions`（1～3）个新增的候选子集，复用同一套协商语义计算每个子集可将多少
+流量从默认兜底转为正常命中，选出改善流量最大的方案（同分依次取新增数更少、
+候选输入序更早）。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -24,6 +28,7 @@ docker compose up -d --build
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/coverage-plan | 候选语言覆盖规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -267,6 +272,88 @@ curl -X POST http://localhost:8000/api/v1/negotiate/group \
 `accept_language.syntax_error`），以及沿用单人接口的
 `supported_languages` / `default_language` 校验。
 
+## 覆盖规划（POST /api/v1/negotiate/coverage-plan）
+
+当运营侧想评估「新增哪些语言能覆盖更多流量」时，使用覆盖规划接口。请求给出
+当前支持列表、默认语言、一组带非负 `traffic` 的 `Accept-Language` 流量样本，
+以及 1～12 个候选新增语言和 `max_additions`（1～3）。服务端**对每个候选子集
+复用与单人接口完全相同的协商语义**，计算可把多少流量从默认兜底转为正常命中，
+穷举选出最优方案。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/coverage-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "supported_languages": ["en-US", "zh-CN"],
+    "default_language": "en-US",
+    "samples": [
+      {"accept_language": "fr-FR,fr;q=0.9", "traffic": 320.5},
+      {"accept_language": "de-DE,de;q=0.8", "traffic": 210},
+      {"accept_language": "zh-CN,zh;q=0.9", "traffic": 500},
+      {"accept_language": "it;q=0.7", "traffic": 45}
+    ],
+    "candidates": ["fr-FR", "de-DE", "it-IT"],
+    "max_additions": 2
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "selected_additions": ["fr-FR", "de-DE"],
+  "baseline_fallback_traffic": 575.5,
+  "improved_traffic": 530.5,
+  "message": "穷举所有不超过 2 个新增的候选组合后，新增 fr-FR、de-DE 可将 530.5 的默认兜底流量转为正常命中（同分按新增数更少、候选输入序更早取舍）",
+  "samples": [
+    {"position": 1, "traffic": 320.5,
+     "baseline_selected_language": "en-US", "baseline_fallback": true,
+     "planned_selected_language": "fr-FR", "planned_fallback": false,
+     "improved": true},
+    {"position": 3, "traffic": 500.0,
+     "baseline_selected_language": "zh-CN", "baseline_fallback": false,
+     "planned_selected_language": "zh-CN", "planned_fallback": false,
+     "improved": false}
+  ]
+}
+```
+
+### 覆盖规划请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `supported_languages` | string[] | 是 | 当前支持的 BCP 47 标签，至少 1 个、不可重复（大小写不敏感） |
+| `default_language` | string | 是 | 默认语言，必须包含在 `supported_languages` 中（大小写不敏感） |
+| `samples` | object[] | 是 | 至少 1 个样本；`accept_language` 可缺省/`null`，`traffic` 为非负数值 |
+| `candidates` | string[] | 是 | 1～12 个候选新增语言；不可重复，且不得已在 `supported_languages` 中（均大小写不敏感） |
+| `max_additions` | int | 是 | 每个方案最多新增的语言数，1～3 |
+
+### 规划规则
+
+1. **基线**：每个样本用现有 `supported_languages` 按单人接口语义协商；回退到
+   默认语言的样本流量计入 `baseline_fallback_traffic`。
+2. **穷举**：枚举候选的所有大小为 0～`max_additions` 的子集（新增语言按候选
+   输入顺序**追加**到支持列表末尾，现有条目的同分优先级不变），重新协商每个
+   基线兜底样本；由「默认兜底」转为「正常命中」的样本流量之和即该子集的
+   改善流量。
+3. **取舍**：改善流量最大者胜出；同分依次取**新增数更少**、**候选输入序更早**
+   的方案。空子集参与竞争，因此任何组合都无改善时返回
+   `selected_additions: []`、`improved_traffic: 0`。
+4. **逐样本明细**：`samples[]` 给出每个样本规划前后选中的语言
+   （`baseline_selected_language` / `planned_selected_language`）、是否回退
+   （`baseline_fallback` / `planned_fallback`）以及是否改善（`improved`，
+   即「基线兜底 → 规划后正常命中」）。`improved=true` 样本的流量之和恒等于
+   `improved_traffic`。
+5. 缺省/`null`/空白的 `accept_language` 视为无有效范围：恒定走默认兜底，
+   计入 `baseline_fallback_traffic`，且任何新增都无法改善它。
+
+校验（均返回 **HTTP 422**）：`samples` 为空、`traffic` 为负数、`candidates`
+为空或超过 12 个、`max_additions` 超出 1～3、候选标签非法/重复/已在支持列表中、
+某样本的 `accept_language` 语法非法（`loc` 形如
+`["body","samples",1,"accept_language"]`，`type` 为
+`accept_language.syntax_error`），以及沿用单人接口的
+`supported_languages` / `default_language` 校验。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -354,7 +441,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 93 个单元/接口测试
+pytest -q          # 114 个单元/接口测试
 ```
 
 ## 项目结构
