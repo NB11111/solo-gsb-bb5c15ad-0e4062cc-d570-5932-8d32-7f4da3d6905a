@@ -297,6 +297,136 @@ class GroupNegotiationResponse(BaseModel):
     candidates: list[GroupCandidateReport]
 
 
+class CoverageTrafficSample(BaseModel):
+    """One observed Accept-Language sample and its non-negative traffic."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    accept_language: str | None = Field(
+        default=None,
+        title="该样本的原始 Accept-Language 头",
+        description="缺失/null/空白视为无有效范围（该样本总是命中默认语言）",
+    )
+    traffic: float = Field(
+        ge=0,
+        title="该样本携带的非负流量",
+        description="作为改善流量的权重（如请求数、占比），不可为负",
+    )
+
+
+class CoveragePlanRequest(BaseModel):
+    """Coverage-plan input.
+
+    A batch of weighted Accept-Language traffic samples is negotiated
+    against the current ``supported_languages`` (with
+    ``default_language`` fallback) and again after adding subsets of
+    ``candidate_languages``; the subset of up to ``max_additions`` tags
+    rescuing the most default-fallback traffic is returned.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    supported_languages: list[str] = Field(
+        min_length=1,
+        title="当前服务端支持的 BCP 47 语言标签（按优先级/稳定顺序排列）",
+    )
+    default_language: str = Field(
+        title="默认语言标签，必须包含在 supported_languages 中"
+    )
+    samples: list[CoverageTrafficSample] = Field(
+        min_length=1,
+        title="带非负 traffic 的 Accept-Language 流量样本（至少 1 条）",
+    )
+    candidate_languages: list[str] = Field(
+        min_length=1,
+        max_length=12,
+        title="候选新增语言（1～12 个，顺序即决胜顺序）",
+    )
+    max_additions: int = Field(
+        ge=1,
+        le=3,
+        title="最多新增语言数（1～3）",
+    )
+
+    @field_validator("supported_languages")
+    @classmethod
+    def _validate_supported(cls, value: list[str]) -> list[str]:
+        return _check_supported_tags(value)
+
+    @field_validator("default_language")
+    @classmethod
+    def _validate_default(cls, value: str) -> str:
+        return _check_default_tag(value)
+
+    @field_validator("candidate_languages")
+    @classmethod
+    def _validate_candidates(cls, value: list[str]) -> list[str]:
+        seen: set[str] = set()
+        for tag in value:
+            if not isinstance(tag, str) or not TAG_RE.fullmatch(tag):
+                raise ValueError(f"不是合法的 BCP 47 标签: {tag!r}")
+            key = tag.lower()
+            if key in seen:
+                raise ValueError(
+                    f"candidate_languages 存在重复标签（大小写不敏感）: {tag!r}"
+                )
+            seen.add(key)
+        return value
+
+    @model_validator(mode="after")
+    def _validate_relations(self) -> "CoveragePlanRequest":
+        _check_default_in_supported(
+            self.supported_languages, self.default_language
+        )
+        supported_lower = {
+            tag.lower() for tag in self.supported_languages
+        }
+        for tag in self.candidate_languages:
+            if tag.lower() in supported_lower:
+                raise ValueError(
+                    "candidate_languages 不能包含已在 supported_languages 中"
+                    f"的标签（大小写不敏感）: {tag!r}"
+                )
+        return self
+
+
+class CoverageSampleReport(BaseModel):
+    accept_language: str | None = Field(
+        description="样本的原始 Accept-Language 头（缺失为 null）"
+    )
+    traffic: float = Field(description="该样本携带的非负流量")
+    before_selected_language: str = Field(
+        description="规划前（当前支持语言下）协商选中的语言"
+    )
+    before_fallback: bool = Field(
+        description="规划前是否走了默认语言兜底"
+    )
+    after_selected_language: str = Field(
+        description="规划后（加入 selected_additions）协商选中的语言"
+    )
+    after_fallback: bool = Field(
+        description="规划后是否仍走默认语言兜底"
+    )
+    improved: bool = Field(
+        description="是否由默认兜底转为正常命中（规划前兜底且规划后非兜底）"
+    )
+
+
+class CoveragePlanResponse(BaseModel):
+    selected_additions: list[str] = Field(
+        description="选出的新增语言（按候选输入顺序）；无任何改善时为空数组"
+    )
+    baseline_fallback_traffic: float = Field(
+        description="规划前走默认兜底的样本流量之和"
+    )
+    improved_traffic: float = Field(
+        description="selected_additions 落地后可由兜底转为正常命中的流量之和"
+    )
+    samples: list[CoverageSampleReport] = Field(
+        description="逐样本的规划前后选中语言、兜底标记与是否改善"
+    )
+
+
 class HealthResponse(BaseModel):
     status: Literal["ok"] = "ok"
     service: str

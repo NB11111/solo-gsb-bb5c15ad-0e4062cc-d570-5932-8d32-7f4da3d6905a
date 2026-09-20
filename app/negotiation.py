@@ -23,6 +23,12 @@ Implements the negotiation rules required by the service:
   participant's concrete ``q=0`` range is globally vetoed, and the winner
   is chosen by highest minimum personal weight, then highest total
   weight, then server-list order.
+* :func:`plan_coverage` plans new supported languages: each weighted
+  Accept-Language traffic sample is evaluated twice with the exact same
+  lookup semantics (before / after adding a candidate subset), and the
+  subset (up to ``max_additions`` tags) that turns the most default
+  fallback traffic into normal hits is chosen by exhaustive search,
+  breaking ties on fewer additions then earlier candidate order.
 
 Language tag grammar follows RFC 5646 (BCP 47) primary tag grammar, which
 covers every ordinary language tag (the legacy "grandfathered" irregular
@@ -33,6 +39,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from itertools import combinations
 from typing import Any
 
 # RFC 5646 section 2.1 grammar (main tag grammar, no grandfathered tags).
@@ -76,6 +83,20 @@ class ParticipantHeaderError(AcceptLanguageError):
 
 class LocaleFallbackError(ValueError):
     """Raised when a ``locale_fallbacks`` mapping is structurally invalid."""
+
+
+class SampleHeaderError(AcceptLanguageError):
+    """A coverage-plan traffic sample's Accept-Language header failed to parse.
+
+    Carries the 1-based ``position`` so the API layer can point the 422
+    response at the exact ``samples`` array element.
+    """
+
+    def __init__(self, position: int, detail: str):
+        self.position = position
+        super().__init__(
+            f"第 {position} 个流量样本的 Accept-Language 非法: {detail}"
+        )
 
 
 def normalize_fallbacks(
@@ -697,4 +718,133 @@ def negotiate_group(
         "message": message,
         "participants": participant_reports,
         "candidates": candidates,
+    }
+
+
+def _sample_eligible(
+    tag: str,
+    parsed: list[LanguageRange],
+    wildcard_q: float | None,
+) -> bool:
+    """Whether adding ``tag`` gives this parsed header a normal hit.
+
+    Mirrors the eligibility branch of :func:`negotiate` exactly: a
+    concrete truncation-prefix match is a hit when its range has a
+    strictly positive q; without a concrete match the wildcard range
+    makes the tag eligible when its q is strictly positive.
+    """
+
+    matched, _prefix = _find_concrete_range(truncation_chain(tag), parsed)
+    if matched is not None:
+        return matched.q > 0
+    return wildcard_q is not None and wildcard_q > 0
+
+
+def plan_coverage(
+    samples: list[tuple[str | None, float]],
+    supported: list[str],
+    default: str,
+    candidates: list[str],
+    max_additions: int,
+) -> dict[str, Any]:
+    """Plan which candidate languages to add for maximum fallback rescue.
+
+    ``samples`` is a list of ``(accept_language, traffic)`` pairs with
+    non-negative traffic. Each subset of ``candidates`` of size up to
+    ``max_additions`` (including the empty subset) is evaluated by
+    appending it to ``supported`` and re-running :func:`negotiate` for
+    every sample: the improved traffic is the total traffic of samples
+    that selected the ``default`` fallback before and get a normal
+    (non-fallback) hit afterwards.
+
+    The winning subset maximizes improved traffic; ties prefer fewer
+    additions, then the subset whose candidate indices are earliest in
+    the request's candidate order (combinations enumerated in that
+    order). The returned per-sample report states the selected language
+    before/after the plan and whether that sample improved.
+    """
+
+    # Parse every header once up front (also validates syntax), then run
+    # the baseline negotiation with the exact existing semantics.
+    parsed_samples: list[list[LanguageRange]] = []
+    baseline_results: list[dict[str, Any]] = []
+    for position, (header, _traffic) in enumerate(samples, start=1):
+        try:
+            parsed = parse_accept_language(header)
+        except AcceptLanguageError as exc:
+            raise SampleHeaderError(position, str(exc)) from exc
+        parsed_samples.append(parsed)
+        baseline_results.append(negotiate(header, supported, default))
+
+    fallback_indices = [
+        i for i, result in enumerate(baseline_results) if result["fallback"]
+    ]
+    baseline_fallback_traffic = round(
+        sum(samples[i][1] for i in fallback_indices), 6
+    )
+
+    # Only samples that currently fall back can be rescued. For each one
+    # precompute which candidate indices would give it a positive-q hit:
+    # a fallback header has no eligible existing supported tag, so any
+    # candidate matching its ranges would become the normal selection.
+    rescue_sets: dict[int, set[int]] = {}
+    for i in fallback_indices:
+        parsed = parsed_samples[i]
+        wildcard = _wildcard_range(parsed)
+        wildcard_q = wildcard.q if wildcard is not None else None
+        rescued_by: set[int] = set()
+        for candidate_index, tag in enumerate(candidates):
+            if _sample_eligible(tag, parsed, wildcard_q):
+                rescued_by.add(candidate_index)
+        rescue_sets[i] = rescued_by
+
+    best_indices: tuple[int, ...] = ()
+    best_improvement = -1.0
+    limit = min(max_additions, len(candidates))
+    for size in range(0, limit + 1):
+        for subset in combinations(range(len(candidates)), size):
+            subset_set = set(subset)
+            improvement = round(
+                sum(
+                    samples[i][1]
+                    for i in fallback_indices
+                    if rescue_sets[i] & subset_set
+                ),
+                6,
+            )
+            # Enumeration order (size ascending, then lexicographic
+            # candidate order) already matches the tie-breakers, so only
+            # a strictly larger improvement replaces the current best.
+            if improvement > best_improvement:
+                best_improvement = improvement
+                best_indices = subset
+
+    selected = [candidates[i] for i in best_indices]
+    planned_supported = [*supported, *selected]
+
+    sample_reports: list[dict[str, Any]] = []
+    improved_traffic = 0.0
+    for i, (header, traffic) in enumerate(samples):
+        before = baseline_results[i]
+        after = negotiate(header, planned_supported, default)
+        improved = bool(before["fallback"] and not after["fallback"])
+        if improved:
+            improved_traffic += traffic
+        sample_reports.append(
+            {
+                "accept_language": header,
+                "traffic": traffic,
+                "before_selected_language": before["selected_language"],
+                "before_fallback": before["fallback"],
+                "after_selected_language": after["selected_language"],
+                "after_fallback": after["fallback"],
+                "improved": improved,
+            }
+        )
+
+    return {
+        "selected_additions": selected,
+        "baseline_fallback_traffic": baseline_fallback_traffic,
+        "improved_traffic": round(improved_traffic, 6),
+        "samples": sample_reports,
     }

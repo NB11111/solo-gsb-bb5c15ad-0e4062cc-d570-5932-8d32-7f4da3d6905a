@@ -7,7 +7,10 @@ BCP 47 语言标签列表与默认语言，依据 RFC 9110 权重规则与 RFC 4
 源标签 → 下一标签有向链做定向回退。此外，`/api/v1/negotiate/group` 提供**群体
 协商**：多位参与者各自给出 `Accept-Language`，逐人复用同一套匹配语义构成权重
 矩阵，具体范围 `q=0` 全局否决，按最低个人权重 → 总权重 → 服务端顺序选出共同
-接受的语言。
+接受的语言。最后，`/api/v1/negotiate/coverage-plan` 提供**覆盖率规划**：携带
+一批带流量权重的 `Accept-Language` 样本与 1～12 个候选新增语言，对每个候选子集
+（至多 3 个）复用同一套协商语义，穷举选出能把最多「默认兜底流量」转为「正常
+命中」的新增方案。
 
 技术栈：Python 3.12 · FastAPI · Pydantic v2 · Uvicorn，依赖在容器构建时安装。
 
@@ -24,6 +27,7 @@ docker compose up -d --build
 | http://localhost:8000/health | 健康检查（`GET`，返回 `{"status":"ok"}`） |
 | http://localhost:8000/api/v1/negotiate | 语言协商接口（`POST`） |
 | http://localhost:8000/api/v1/negotiate/group | 群体语言协商接口（`POST`） |
+| http://localhost:8000/api/v1/negotiate/coverage-plan | 候选新增语言覆盖率规划接口（`POST`） |
 | http://localhost:8000/docs | Swagger UI 交互式文档 |
 | http://localhost:8000/openapi.json | OpenAPI 3 描述 |
 
@@ -267,6 +271,127 @@ curl -X POST http://localhost:8000/api/v1/negotiate/group \
 `accept_language.syntax_error`），以及沿用单人接口的
 `supported_languages` / `default_language` 校验。
 
+## 覆盖率规划（POST /api/v1/negotiate/coverage-plan）
+
+当需要决定「下一批应该新增支持哪些语言」时，使用覆盖率规划接口。请求携带**当前
+支持语言**、**默认语言**、一批带非负 `traffic` 权重的 `Accept-Language` 流量
+样本，以及 1～12 个**候选新增语言**与 `max_additions`（1～3）。服务端对每个
+候选子集（新增数 0～`max_additions`）**逐样本复用与单人接口完全相同的 RFC
+9110/4647 lookup 协商语义**，计算能把多少原本走**默认语言兜底**的样本转为
+**正常命中**（其 `traffic` 之和即改善流量），并穷举选出最优方案。
+
+```bash
+curl -X POST http://localhost:8000/api/v1/negotiate/coverage-plan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "supported_languages": ["en-US", "zh-CN"],
+    "default_language": "en-US",
+    "samples": [
+      {"accept_language": "fr-FR,fr;q=0.9", "traffic": 100},
+      {"accept_language": "de",               "traffic": 60},
+      {"accept_language": "zh-CN",            "traffic": 300},
+      {"accept_language": "fr;q=0",           "traffic": 25},
+      {"accept_language": null,               "traffic": 10}
+    ],
+    "candidate_languages": ["fr-FR", "de-DE"],
+    "max_additions": 2
+  }'
+```
+
+响应：
+
+```json
+{
+  "selected_additions": ["fr-FR", "de-DE"],
+  "baseline_fallback_traffic": 195.0,
+  "improved_traffic": 160.0,
+  "samples": [
+    {
+      "accept_language": "fr-FR,fr;q=0.9",
+      "traffic": 100.0,
+      "before_selected_language": "en-US",
+      "before_fallback": true,
+      "after_selected_language": "fr-FR",
+      "after_fallback": false,
+      "improved": true
+    },
+    {
+      "accept_language": "de",
+      "traffic": 60.0,
+      "before_selected_language": "en-US",
+      "before_fallback": true,
+      "after_selected_language": "de-DE",
+      "after_fallback": false,
+      "improved": true
+    },
+    {
+      "accept_language": "zh-CN",
+      "traffic": 300.0,
+      "before_selected_language": "zh-CN",
+      "before_fallback": false,
+      "after_selected_language": "zh-CN",
+      "after_fallback": false,
+      "improved": false
+    },
+    {
+      "accept_language": "fr;q=0",
+      "traffic": 25.0,
+      "before_selected_language": "en-US",
+      "before_fallback": true,
+      "after_selected_language": "en-US",
+      "after_fallback": true,
+      "improved": false
+    },
+    {
+      "accept_language": null,
+      "traffic": 10.0,
+      "before_selected_language": "en-US",
+      "before_fallback": true,
+      "after_selected_language": "en-US",
+      "after_fallback": true,
+      "improved": false
+    }
+  ]
+}
+```
+
+### 规划请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `supported_languages` | string[] | 是 | 当前支持的 BCP 47 标签（与单人接口相同，顺序即稳定优先级） |
+| `default_language` | string | 是 | 默认语言，必须包含在 `supported_languages` 中 |
+| `samples` | object[] | 是 | 至少 1 条流量样本；每条含 `accept_language`（可缺省/`null`，语义同单人接口）与 `traffic`（**非负**数值） |
+| `candidate_languages` | string[] | 是 | 1～12 个候选新增语言；合法 BCP 47 标签、**互不重复**（大小写不敏感），且**不得已在 `supported_languages` 中**；**数组顺序即同分决胜顺序** |
+| `max_additions` | integer | 是 | 方案最多新增语言数，取值 1～3 |
+
+### 规划规则
+
+1. **基线**：先对每条样本按当前 `supported_languages` 跑一次单人协商；
+   `fallback=true`（走默认语言兜底）的样本流量之和为 `baseline_fallback_traffic`。
+2. **穷举**：枚举候选语言的所有子集，大小从 0 到 `min(max_additions,
+   候选数)`；子集整体按候选输入顺序**追加**到支持语言末尾（现有语言的优先级
+   不变），再对全部样本重新协商。
+3. **改善流量**：仅当样本**规划前走默认兜底**且**规划后正常命中**
+   （`fallback` 由 `true` 变 `false`，含通配符或具体范围命中）时，其
+   `traffic` 计入 `improved_traffic`。已经正常命中的样本即使选中语言发生
+   变化，也不计改善；被具体 `q=0` 范围排除（按逐级截断前缀判定）或通配符
+   `*;q=0` 归零的样本无法被任何候选救援。
+4. **决胜顺序**：改善流量最大 → 新增数更少 → 子集的候选输入序更早
+   （字典序）。因此没有任何改善时返回空数组 `selected_additions: []`。
+5. **逐样本报告**：`samples[]` 与请求顺序一一对应，给出规划前/后的选中语言
+   （`before_selected_language` / `after_selected_language`）、兜底标记
+   （`before_fallback` / `after_fallback`）与 `improved`。
+6. 本接口不涉及 `locale_fallbacks` 定向链；候选与现有语言适用完全相同的
+   lookup 匹配语义。
+
+校验（均返回 **HTTP 422**）：`samples` 为空、`traffic` 为负数、某样本
+`accept_language` 语法非法（`loc` 形如
+`["body","samples",1,"accept_language"]`，`type` 为
+`accept_language.syntax_error`）、`candidate_languages` 数量越界/标签非法/
+重复/与现有支持语言重叠、`max_additions` 不在 1～3，以及沿用单人接口的
+`supported_languages` / `default_language` 校验。
+
 ## 协商规则
 
 1. **q 权重**：遵循 RFC 9110，缺省 `q=1`；合法写法为 `0`–`1`、最多 3 位小数
@@ -354,7 +479,7 @@ docker run --rm -p 8000:8000 -e UVICORN_WORKERS=2 language-negotiator
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000
-pytest -q          # 93 个单元/接口测试
+pytest -q          # 118 个单元/接口测试
 ```
 
 ## 项目结构

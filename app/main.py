@@ -9,10 +9,14 @@ from . import __version__
 from .negotiation import (
     AcceptLanguageError,
     ParticipantHeaderError,
+    SampleHeaderError,
     negotiate,
     negotiate_group,
+    plan_coverage,
 )
 from .schemas import (
+    CoveragePlanRequest,
+    CoveragePlanResponse,
     GroupNegotiationRequest,
     GroupNegotiationResponse,
     HealthResponse,
@@ -29,6 +33,10 @@ app = FastAPI(
         "另提供 /api/v1/negotiate/group 群体协商：对多位参与者逐人复用相同的"
         "匹配语义构成权重矩阵，具体范围 q=0 全局否决，按最低个人权重 → 总权重 → "
         "服务端顺序选出共同接受的语言。"
+        "以及 /api/v1/negotiate/coverage-plan 覆盖率规划：对带流量的 "
+        "Accept-Language 样本逐人复用相同匹配语义，穷举 1～3 个候选新增语言"
+        "子集，选出能把最多默认兜底流量转为正常命中的方案（同分看新增数更少、"
+        "候选输入序更早）。"
     ),
     version=__version__,
 )
@@ -71,6 +79,31 @@ async def participant_header_error_handler(
                     "loc": [
                         "body",
                         "participants",
+                        exc.position - 1,
+                        "accept_language",
+                    ],
+                    "msg": str(exc),
+                    "type": "accept_language.syntax_error",
+                }
+            ]
+        },
+    )
+
+
+@app.exception_handler(SampleHeaderError)
+async def sample_header_error_handler(
+    request: Request, exc: SampleHeaderError
+) -> JSONResponse:
+    # Same 422 envelope shape, but located at the offending traffic
+    # sample's array element (FastAPI loc paths use 0-based indices).
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": [
+                {
+                    "loc": [
+                        "body",
+                        "samples",
                         exc.position - 1,
                         "accept_language",
                     ],
@@ -130,6 +163,25 @@ async def negotiate_group_language(
     return GroupNegotiationResponse.model_validate(result)
 
 
+@app.post(
+    "/api/v1/negotiate/coverage-plan",
+    response_model=CoveragePlanResponse,
+    tags=["语言协商"],
+    summary="候选新增语言的覆盖率规划",
+)
+async def negotiate_coverage_plan(
+    payload: CoveragePlanRequest,
+) -> CoveragePlanResponse:
+    result = plan_coverage(
+        samples=[(s.accept_language, s.traffic) for s in payload.samples],
+        supported=payload.supported_languages,
+        default=payload.default_language,
+        candidates=payload.candidate_languages,
+        max_additions=payload.max_additions,
+    )
+    return CoveragePlanResponse.model_validate(result)
+
+
 @app.get("/", tags=["元信息"])
 async def root() -> dict[str, str]:
     return {
@@ -139,4 +191,5 @@ async def root() -> dict[str, str]:
         "health": "/health",
         "negotiate": "POST /api/v1/negotiate",
         "negotiate_group": "POST /api/v1/negotiate/group",
+        "negotiate_coverage_plan": "POST /api/v1/negotiate/coverage-plan",
     }
